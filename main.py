@@ -1,115 +1,121 @@
-# 匯入所需模組
-import cv2                     # OpenCV，用於影像處理與攝影機控制
-import mediapipe as mp         # MediaPipe，用於手部關鍵點偵測
-import pyautogui               # 控制滑鼠
-import time                    # 處理時間控制
-from collections import deque  # 雙向佇列，用於平滑化滑鼠移動
-import numpy as np             # 數學運算工具
-import math                    # 提供平方根等基本數學函式
+# ------------------ 套件載入 ------------------
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+import numpy as np
+import math
 
-# 判斷是否為握拳（✊）
-def is_fist(landmarks):
-    # 定義各指尖與對應第二關節的 landmark index
-    finger_tips = [8, 12, 16, 20]
-    finger_pips = [6, 10, 14, 18]
-    curled_fingers = 5  # 預設認為全部手指都是彎曲的
-    threshold = 0.03    # 閾值：越小代表要求越靠近
+# ------------------ 可調參數 ------------------
+EMA_ALPHA           = 0.4   # 指數移動平均係數
+CLICK_THRESHOLD     = 0.05  # 點擊判斷距離 (拇指-食指)
+CLICK_COOLDOWN      = 0.5   # 點擊冷卻秒數
+FIST_DIST_THRESHOLD = 0.08  # 拳頭判斷距離
+FIST_FRAMES         = 7     # 連續幀數才視為握拳
+TARGET_FPS          = 30    # FPS 上限
+CAM_W, CAM_H        = 480, 270
 
-    # 比較每根手指尖與第二關節的 y 座標
-    for tip, pip in zip(finger_tips, finger_pips):
-        tip_y = landmarks[tip].y
-        pip_y = landmarks[pip].y
-        if tip_y > pip_y:  # 如果指尖比關節還低，表示彎曲
-            curled_fingers += 1
-
-    return curled_fingers >= 4  # 至少 4 根彎曲就當作握拳
-
-# 取得螢幕解析度
+# ------------------------------------------------
+pyautogui.FAILSAFE = False
 screen_w, screen_h = pyautogui.size()
 
-# 初始化 MediaPipe Hands 模組
+# -------- MediaPipe Hands 初始化 (輕量模型) -------
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
-mp_draw = mp.solutions.drawing_utils  # 用於畫手部骨架
+hands = mp_hands.Hands(max_num_hands=1,
+                       min_detection_confidence=0.7,
+                       model_complexity=0)
 
-# 建立滑鼠移動軌跡的緩衝區，用於平滑化滑鼠座標
-mouse_history = deque(maxlen=5)
+# ---------- 狀態變數 ----------
+mouse_pos_ema  = None        # EMA 平滑游標
+last_click_time = time.time() - CLICK_COOLDOWN
+prev_dist       = 1.0        # 前一幀拇指-食指距離
+fist_streak     = 0          # 連續握拳幀計數
 
-# 控制定點擊頻率（冷卻時間），避免重複觸發
-click_cooldown = 0.5
-last_click_time = time.time() - click_cooldown
-
-# 啟動攝影機
+# ------------ 攝影機 ------------
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+prev_time = time.time()
 
-# 設定 OpenCV 視窗為全螢幕
-cv2.namedWindow("Hand Tracking", cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty("Hand Tracking", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+# ----------- 函式：判斷握拳 -----------
+def is_fist(landmarks):
+    finger_tips = [8, 12, 16, 20]
+    finger_pips = [6, 10, 14, 18]
+    curled = sum(landmarks[tip].y > landmarks[pip].y + 0.02
+                 for tip, pip in zip(finger_tips, finger_pips))
+    dist = math.hypot(landmarks[8].x - landmarks[4].x,
+                      landmarks[8].y - landmarks[4].y)
+    return dist < FIST_DIST_THRESHOLD and curled >= 3
 
-# 主迴圈
+# ------------------ 主迴圈 ------------------
 while cap.isOpened():
-    success, frame = cap.read()  # 讀取攝影機畫面
-    if not success:
-        continue  # 如果讀取失敗就跳過這幀
+    ret, frame = cap.read()
+    if not ret:
+        continue
 
-    frame = cv2.flip(frame, 1)  # 左右鏡像翻轉，符合自然操作
-    h, w, _ = frame.shape       # 取得畫面高度與寬度
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # 轉換顏色給 MediaPipe
-    result = hands.process(rgb_frame)  # 執行手部偵測
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
 
-    # 如果有偵測到手
-    if result.multi_hand_landmarks:
-        for hand_landmarks in result.multi_hand_landmarks:
-            # 取得 Landmark 4（拇指指尖）與 Landmark 8（食指指尖）
-            thumb_tip = hand_landmarks.landmark[4]
-            index_tip = hand_landmarks.landmark[8]
+    if results.multi_hand_landmarks:
+        lm = results.multi_hand_landmarks[0]
 
-            # 畫出食指指尖的圓圈提示
-            x = int(index_tip.x * w)
-            y = int(index_tip.y * h)
-            cv2.circle(frame, (x, y), 10, (255, 0, 255), -1)
+        # ----------- 取關鍵 Landmark -----------
+        thumb_tip  = lm.landmark[4]   # 拇指尖
+        index_tip  = lm.landmark[8]   # 食指尖
+        index_dip  = lm.landmark[7]   # 食指 DIP（較穩定）
 
-            # 將食指位置轉成螢幕座標
-            screen_x = int(index_tip.x * screen_w)
-            screen_y = int(index_tip.y * screen_h)
-            mouse_history.append((screen_x, screen_y))  # 加入滑鼠歷史紀錄
+        # ----------- 游標移動 (常態：index_dip) ----------
+        target_x = int(index_dip.x * screen_w)
+        target_y = int(index_dip.y * screen_h)
 
-            # 當滑鼠移動記錄滿時，計算平均座標並移動滑鼠
-            if len(mouse_history) == mouse_history.maxlen:
-                avg_x = int(np.mean([p[0] for p in mouse_history]))
-                avg_y = int(np.mean([p[1] for p in mouse_history]))
-                pyautogui.moveTo(avg_x, avg_y)
+        if mouse_pos_ema is None:
+            mouse_pos_ema = np.array([target_x, target_y], float)
+        mouse_pos_ema = (1-EMA_ALPHA)*mouse_pos_ema + EMA_ALPHA*np.array([target_x, target_y])
+        pyautogui.moveTo(int(mouse_pos_ema[0]), int(mouse_pos_ema[1]))
 
-            # 計算拇指與食指的距離（判斷是否觸碰）
-            dx = index_tip.x - thumb_tip.x
-            dy = index_tip.y - thumb_tip.y
-            dist = math.sqrt(dx * dx + dy * dy)
+        # ----------- 拇指-食指距離 -----------
+        dist = math.hypot(index_tip.x - thumb_tip.x,
+                          index_tip.y - thumb_tip.y)
 
-            # 如果距離很近，並且超過冷卻時間，就觸發滑鼠點擊
-            if dist < 0.03 and (time.time() - last_click_time) > click_cooldown:
-                pyautogui.click()
-                print("🖱️ Clicked!")
-                last_click_time = time.time()
+        # 邊緣觸發點擊：上一幀距離>門檻，本幀<=門檻
+        if prev_dist > CLICK_THRESHOLD and dist <= CLICK_THRESHOLD and \
+           (time.time() - last_click_time) > CLICK_COOLDOWN:
 
-            # 如果偵測到握拳，就退出程式
-            if is_fist(hand_landmarks.landmark):
+            # 以「拇指-食指中心點」當作真實點擊座標
+            center_x = int(((index_tip.x + thumb_tip.x) / 2) * screen_w)
+            center_y = int(((index_tip.y + thumb_tip.y) / 2) * screen_h)
+            # pyautogui.moveTo(center_x, center_y)  # 撐住游標不偏移
+            pyautogui.click()
+            print("🖱️ Clicked!")
+            last_click_time = time.time()
+
+        prev_dist = dist  # 更新前一幀距離
+
+        # ----------- 握拳判定 -----------
+        if is_fist(lm.landmark):
+            fist_streak += 1
+            if fist_streak >= FIST_FRAMES:
                 print("👊 偵測到握拳，退出程式！")
-                cap.release()
-                cv2.destroyAllWindows()
-                hands.close()
-                exit()
+                break
+        else:
+            fist_streak = 0
 
-            # 畫出手部骨架與連線
-            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-    # 顯示畫面
+    # ---------------- 畫面顯示 ----------------
     cv2.imshow("Hand Tracking", frame)
 
-    # 按下 ESC 或點視窗右上角關閉都能退出
-    if cv2.waitKey(1) & 0xFF == 27 or cv2.getWindowProperty("Hand Tracking", cv2.WND_PROP_VISIBLE) < 1:
+    # 離開條件
+    if cv2.waitKey(1) & 0xFF == 27 or \
+       cv2.getWindowProperty("Hand Tracking", cv2.WND_PROP_VISIBLE) < 1:
         break
 
-# 資源釋放
+    # FPS 控制
+    elapsed = time.time() - prev_time
+    time.sleep(max(0, (1 / TARGET_FPS) - elapsed))
+    prev_time = time.time()
+
+# -------- 資源釋放 --------
 cap.release()
 cv2.destroyAllWindows()
 hands.close()
